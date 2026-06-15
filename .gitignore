@@ -1,0 +1,16 @@
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Rock Shop runtime working/staging dirs (created at install time, never committed)
+App_Data/RockShop/
+App_Data/InstalledStorePackages.json
+
+# Build output
+bin/
+obj/
+*.user
+
+# stray sandbox test artifacts (cannot be deleted in this mount; harmless)
+.gitignore_tmp_remove
+*.ovtest
