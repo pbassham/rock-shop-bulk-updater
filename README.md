@@ -11,9 +11,7 @@ Built for exactly the situation this was written for: a big wave of plugin updat
 | `Plugins/org_ccbcfamily/Store/BatchPackageInstall.ascx` | `~/Plugins/org_ccbcfamily/Store/` |
 | `Plugins/org_ccbcfamily/Store/BatchPackageInstall.ascx.cs` | `~/Plugins/org_ccbcfamily/Store/` (same folder) |
 
-> Rename the `org_ccbcfamily` folder and the namespace if you prefer your own org code — just keep the folder name and the `namespace` line in the `.cs` in sync, and update the block path you register.
-
-## How it works (the important part)
+## How it works 
 
 The two annoyances both come from how Rock's own installer behaves:
 
