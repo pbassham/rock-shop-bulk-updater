@@ -55,6 +55,7 @@ No Visual Studio build is required: the `.ascx` uses `CodeFile`, so RockWeb comp
 ## Known limitations / honest caveats
 
 - **`web.config` XDT transforms** (uncommon) are applied during the loop, not deferred, and can trigger an earlier recycle. Install that kind of plugin on its own.
-- **A locked DLL** can make a single `/bin` copy fail; the block reports those and logs them to the Exception Log. Re-run or apply that one plugin individually.
+- **A locked DLL** can make a single `/bin` copy fail; the block names the file and package in the warning and logs the full path to the Exception Log. Re-run or apply that one plugin individually.
+- **Shared DLLs are copied once.** When several packages (or several version steps of one package) ship the same `/bin` file — e.g. `BouncyCastle.Crypto.dll` in both Church Online Platform Webhooks and Acme Certificate — only the last one queued is written. Copying the same file over itself back-to-back used to trip a lock and show a false "could not be applied" warning.
 - **No public store API exists** for headless/scripted installs. This block minimizes login + restart to one each — it can't eliminate them.
 - Re-validate the `BinDirectoryBlacklist` after a **major Rock upgrade**.

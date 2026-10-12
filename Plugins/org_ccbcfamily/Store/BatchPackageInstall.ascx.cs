@@ -146,6 +146,7 @@ namespace RockWeb.Plugins.org_ccbcfamily.Store
             public bool IsDelete;
             public string StagedPath;   // source file in the staging area (for copies)
             public string DestPath;     // absolute destination under ~/bin
+            public string PackageName;  // package that queued it, for error reporting
         }
 
         /// <summary>One row in the post-run results table.</summary>
@@ -451,11 +452,11 @@ namespace RockWeb.Plugins.org_ccbcfamily.Store
                 {
                     foreach ( ZipArchiveEntry entry in packageZip.Entries )
                     {
-                        wasActionTaken = ProcessZipEntry( entry, appRoot, stagingRoot, purchaseResponse.PackageId, deferredBinOps ) || wasActionTaken;
+                        wasActionTaken = ProcessZipEntry( entry, appRoot, stagingRoot, purchaseResponse.PackageId, result.PackageName, deferredBinOps ) || wasActionTaken;
                     }
 
                     wasActionTaken = ProcessRunSql( packageZip ) || wasActionTaken;
-                    wasActionTaken = ProcessDeleteFileList( packageZip, appRoot, deferredBinOps ) || wasActionTaken;
+                    wasActionTaken = ProcessDeleteFileList( packageZip, appRoot, result.PackageName, deferredBinOps ) || wasActionTaken;
                 }
 
                 if ( !wasActionTaken )
@@ -487,7 +488,7 @@ namespace RockWeb.Plugins.org_ccbcfamily.Store
         /// </summary>
         private void FinishWithResults( List<InstallResult> results, List<DeferredBinOp> deferredBinOps, string stagingRoot, string stoppedEarly )
         {
-            int binFlushErrors = FlushDeferredBinOps( deferredBinOps );
+            var binFlushFailures = FlushDeferredBinOps( deferredBinOps );
 
             // Clear caches so Rock re-reads everything when it comes back up.
             RockCache.ClearAllCachedItems();
@@ -495,16 +496,30 @@ namespace RockWeb.Plugins.org_ccbcfamily.Store
             // Tidy the staging folder (App_Data - safe, no recycle).
             TryDeleteDirectory( stagingRoot );
 
-            RenderResults( results, deferredBinOps.Count, binFlushErrors, stoppedEarly );
+            RenderResults( results, deferredBinOps.Count, binFlushFailures, stoppedEarly );
+        }
+
+        /// <summary>
+        /// Queues a /bin change, replacing any earlier change to the same file. Packages can
+        /// ship the same DLL (e.g. BouncyCastle.Crypto.dll in both Church Online Webhooks and
+        /// Acme Certificate) and multi-step updates repeat it per version; copying it over
+        /// itself back-to-back can hit a lock from the previous write. Last one queued wins,
+        /// which matches the order the individual installs would have applied them.
+        /// </summary>
+        private static void QueueBinOp( List<DeferredBinOp> deferredBinOps, DeferredBinOp op )
+        {
+            deferredBinOps.RemoveAll( o => string.Equals( o.DestPath, op.DestPath, StringComparison.OrdinalIgnoreCase ) );
+            deferredBinOps.Add( op );
         }
 
         /// <summary>
         /// Copies/deletes every staged /bin item. This is deliberately the LAST thing the
         /// request does, so the resulting app-domain recycle happens once, after we return.
+        /// Returns a description of each change that could not be applied.
         /// </summary>
-        private int FlushDeferredBinOps( List<DeferredBinOp> ops )
+        private List<string> FlushDeferredBinOps( List<DeferredBinOp> ops )
         {
-            int errors = 0;
+            var failures = new List<string>();
             foreach ( var op in ops )
             {
                 try
@@ -526,11 +541,15 @@ namespace RockWeb.Plugins.org_ccbcfamily.Store
                 }
                 catch ( Exception ex )
                 {
-                    errors++;
-                    LogError( ex );
+                    var description = string.Format( "{0} ({1})", Path.GetFileName( op.DestPath ), op.PackageName );
+                    failures.Add( description );
+                    LogError( new Exception(
+                        string.Format( "Batch Plugin Update could not {0} '{1}' for {2}: {3}",
+                            op.IsDelete ? "delete" : "copy", op.DestPath, op.PackageName, ex.Message ),
+                        ex ) );
                 }
             }
-            return errors;
+            return failures;
         }
 
         #endregion
@@ -541,7 +560,7 @@ namespace RockWeb.Plugins.org_ccbcfamily.Store
         /// Processes one content entry. Non-/bin files are written immediately; XDT transforms
         /// are applied immediately; /bin DLLs are extracted to staging and queued for the flush.
         /// </summary>
-        private bool ProcessZipEntry( ZipArchiveEntry entry, string appRoot, string stagingRoot, int packageId, List<DeferredBinOp> deferredBinOps )
+        private bool ProcessZipEntry( ZipArchiveEntry entry, string appRoot, string stagingRoot, int packageId, string packageName, List<DeferredBinOp> deferredBinOps )
         {
             if ( entry.Length == 0 )
             {
@@ -590,11 +609,12 @@ namespace RockWeb.Plugins.org_ccbcfamily.Store
                 EnsureDirectoryExists( Path.GetDirectoryName( stagedPath ) );
                 entry.ExtractToFile( stagedPath, true );
 
-                deferredBinOps.Add( new DeferredBinOp
+                QueueBinOp( deferredBinOps, new DeferredBinOp
                 {
                     IsDelete = false,
                     StagedPath = stagedPath,
-                    DestPath = Path.Combine( appRoot, relativePath.Replace( "/", Path.DirectorySeparatorChar.ToString() ) )
+                    DestPath = Path.Combine( appRoot, relativePath.Replace( "/", Path.DirectorySeparatorChar.ToString() ) ),
+                    PackageName = packageName
                 } );
 
                 return true;
@@ -640,7 +660,7 @@ namespace RockWeb.Plugins.org_ccbcfamily.Store
             return true;
         }
 
-        private bool ProcessDeleteFileList( ZipArchive packageZip, string appRoot, List<DeferredBinOp> deferredBinOps )
+        private bool ProcessDeleteFileList( ZipArchive packageZip, string appRoot, string packageName, List<DeferredBinOp> deferredBinOps )
         {
             var deleteListEntry = packageZip.Entries
                 .FirstOrDefault( e => e.FullName == "install/deletefile.lst" || e.FullName == "install\\deletefile.lst" );
@@ -678,10 +698,11 @@ namespace RockWeb.Plugins.org_ccbcfamily.Store
                 // Defer deletes that target /bin so they happen in the single final flush.
                 if ( IsBinPath( normalized ) )
                 {
-                    deferredBinOps.Add( new DeferredBinOp
+                    QueueBinOp( deferredBinOps, new DeferredBinOp
                     {
                         IsDelete = true,
-                        DestPath = Path.Combine( appRoot, normalized.Replace( "/", Path.DirectorySeparatorChar.ToString() ) )
+                        DestPath = Path.Combine( appRoot, normalized.Replace( "/", Path.DirectorySeparatorChar.ToString() ) ),
+                        PackageName = packageName
                     } );
                     continue;
                 }
@@ -790,7 +811,7 @@ namespace RockWeb.Plugins.org_ccbcfamily.Store
             lMessages.Text = string.Format( "<div class='alert alert-warning'>{0}</div>", message );
         }
 
-        private void RenderResults( List<InstallResult> results, int totalBinOps, int binFlushErrors, string stoppedEarly )
+        private void RenderResults( List<InstallResult> results, int totalBinOps, List<string> binFlushFailures, string stoppedEarly )
         {
             pnlList.Visible = false;
             pnlResults.Visible = true;
@@ -805,6 +826,8 @@ namespace RockWeb.Plugins.org_ccbcfamily.Store
                 notice.AppendFormat( "<div class='alert alert-danger'>{0}</div>", stoppedEarly );
             }
 
+            int appliedBinOps = totalBinOps - binFlushFailures.Count;
+
             if ( successes > 0 )
             {
                 notice.AppendFormat(
@@ -813,16 +836,18 @@ namespace RockWeb.Plugins.org_ccbcfamily.Store
                     + "plugin assemblies &mdash; give it a minute, then refresh. This is the single restart for the whole batch.</div>",
                     successes,
                     successes == 1 ? string.Empty : "s",
-                    totalBinOps,
-                    totalBinOps == 1 ? string.Empty : "s" );
+                    appliedBinOps,
+                    appliedBinOps == 1 ? string.Empty : "s" );
             }
 
-            if ( binFlushErrors > 0 )
+            if ( binFlushFailures.Any() )
             {
                 notice.AppendFormat(
-                    "<div class='alert alert-warning'>{0} DLL file change{1} could not be applied (the file may have been locked). "
-                    + "Check the Exception Log and re-run, or apply that plugin individually.</div>",
-                    binFlushErrors, binFlushErrors == 1 ? string.Empty : "s" );
+                    "<div class='alert alert-warning'>{0} DLL file change{1} could not be applied (the file may have been locked): "
+                    + "<strong>{2}</strong>. Re-run, or apply that plugin individually. Details are in the Exception Log.</div>",
+                    binFlushFailures.Count,
+                    binFlushFailures.Count == 1 ? string.Empty : "s",
+                    binFlushFailures.Select( f => f.EncodeHtml() ).JoinStrings( ", " ) );
             }
 
             if ( failures > 0 )
